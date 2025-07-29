@@ -1,15 +1,24 @@
+# brain_mri_trainer.py
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import transforms
+from torchvision import transforms, datasets
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
 from tqdm import tqdm
-import numpy as np
+import GPUtil
 
-# ---- 멤리스터 LUT 처리 ----
+# ---- Configurations ----
+data_root = './dataset/brain_mri'
+pot_path = './value2/C1D1_potentiation.txt'
+dep_path = './value2/C1D1_depression.txt'
+num_classes = 4
+batch_size = 16
+epochs = 10
+lr = 0.01
+image_size = 224
+
+# ---- Memristor LUT Loading ----
 def load_values(pot_path, dep_path):
     def read_file(path):
         with open(path, 'r') as f:
@@ -26,47 +35,54 @@ def load_values(pot_path, dep_path):
     combined = torch.tensor(sorted(set(combined)), dtype=torch.float32)
     return combined
 
-# ---- 멤리스터-aware Linear Layer ----
+# ---- Memristor-aware Linear Layer ----
 class MemristorLinear(nn.Module):
     def __init__(self, in_features, out_features, values):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.values = values
-        self.w_idx = nn.Parameter(torch.randint(0, len(values), (out_features, in_features)), requires_grad=False)
+        self.values = values.to('cuda' if torch.cuda.is_available() else 'cpu')
+        self.w_idx = nn.Parameter(torch.randint(0, len(values), (out_features, in_features), device=self.values.device), requires_grad=False)
         self.bias = nn.Parameter(torch.zeros(out_features))
 
     def forward(self, x):
         self.input_cache = x.detach()
         weight = self.values[self.w_idx]
-        return F.linear(x, weight, self.bias)
+        return nn.functional.linear(x, weight, self.bias)
 
     def index_step(self, grad_output, input_cache, lr):
         with torch.no_grad():
-            grad_input = input_cache
-            grad_output = grad_output
-            grad_w = grad_output.T @ grad_input / grad_output.size(0)
+            grad_w = grad_output.T @ input_cache / grad_output.size(0)
             current_val = self.values[self.w_idx]
             updated_val = current_val - lr * grad_w
 
-            # LUT 최적화: 반복문으로 argmin
-            new_idx = torch.zeros_like(self.w_idx)
+            new_idx = torch.empty_like(self.w_idx)
             for i in range(self.out_features):
                 for j in range(self.in_features):
                     diff = torch.abs(self.values - updated_val[i, j])
                     new_idx[i, j] = torch.argmin(diff)
             self.w_idx.copy_(new_idx)
 
-# ---- 멤리스터-aware 네트워크 ----
-class MemristorNet(nn.Module):
+# ---- CNN + Memristor Model Definition ----
+class MemristorCNN(nn.Module):
     def __init__(self, values):
         super().__init__()
-        self.fc1 = MemristorLinear(112 * 112 * 3, 512, values)
-        self.fc2 = MemristorLinear(512, 4, values)
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        self.flatten = nn.Flatten()
+        self.fc1 = MemristorLinear(32 * (image_size // 4) * (image_size // 4), 512, values)
+        self.fc2 = MemristorLinear(512, num_classes, values)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = F.relu(self.fc1(x))
+        x = self.conv(x)
+        x = self.flatten(x)
+        x = nn.functional.relu(self.fc1(x))
         self.hidden_act = x.detach()
         x = self.fc2(x)
         return x
@@ -76,49 +92,57 @@ class MemristorNet(nn.Module):
         grad_hidden = grad_output @ self.fc2.values[self.fc2.w_idx]
         self.fc1.index_step(grad_hidden, input_cache, lr)
 
-# ---- 경로 설정 및 전처리 ----
-base_dir = "./dataset/brain_mri"
-train_dir = os.path.join(base_dir, "Training")
-val_dir = os.path.join(base_dir, "Testing")
-
+# ---- Data Transforms ----
 train_transform = transforms.Compose([
-    transforms.Resize((112, 112)),
+    transforms.Grayscale(),
+    transforms.Resize((image_size, image_size)),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.Normalize([0.5], [0.5])
 ])
 
 val_transform = transforms.Compose([
-    transforms.Resize((112, 112)),
+    transforms.Grayscale(),
+    transforms.Resize((image_size, image_size)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.Normalize([0.5], [0.5])
 ])
 
-train_dataset = ImageFolder(root=train_dir, transform=train_transform)
-val_dataset = ImageFolder(root=val_dir, transform=val_transform)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+# ---- Datasets ----
+train_dataset = datasets.ImageFolder(root=os.path.join(data_root, 'Training'), transform=train_transform)
+val_dataset = datasets.ImageFolder(root=os.path.join(data_root, 'Testing'), transform=val_transform)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-# ---- 멤리스터 LUT 불러오기 ----
-pot_path = "./value2/C1D1_potentiation.txt"
-dep_path = "./value2/C1D1_depression.txt"
+# ---- Load LUT ----
 values = load_values(pot_path, dep_path)
 
-# ---- 모델, 손실함수, 학습 ----
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = MemristorNet(values).to(device)
+# ---- Model, Loss, Device ----
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = MemristorCNN(values).to(device)
 criterion = nn.CrossEntropyLoss()
 lr = 0.01
 
+# ---- Training ----
 best_acc = 0.0
-for epoch in range(1, 11):
+for epoch in range(1, epochs + 1):
     model.train()
     correct = 0
     total = 0
+    print("Start training loop")
+    print(f"Total training images: {len(train_dataset)}")
+
     loop = tqdm(train_loader, desc=f"[Epoch {epoch}]")
+
     for inputs, labels in loop:
         inputs, labels = inputs.to(device), labels.to(device)
-        inputs_flat = inputs.view(inputs.size(0), -1)
+
+        # GPU 메모리 확인
+        if torch.cuda.is_available():
+            gpu = GPUtil.getGPUs()[0]
+
+        # Forward
+        inputs_flat = model.flatten(model.conv(inputs))
         outputs = model(inputs)
         loss = criterion(outputs, labels)
 
@@ -130,9 +154,11 @@ for epoch in range(1, 11):
         correct += (preds == labels).sum().item()
         total += labels.size(0)
         acc = correct / total * 100
-        loop.set_postfix(loss=loss.item(), acc=acc)
 
-    # 검증
+        # tqdm 상태창 업데이트
+        loop.set_postfix(loss=loss.item(), acc=acc, gpu_mem=f"{gpu.memoryUsed}/{gpu.memoryTotal} MB")
+
+    # ---- Validation ----
     model.eval()
     correct = 0
     total = 0
@@ -145,7 +171,9 @@ for epoch in range(1, 11):
             total += labels.size(0)
     val_acc = correct / total * 100
     print(f"Validation Accuracy: {val_acc:.2f}%")
+
     if val_acc > best_acc:
         best_acc = val_acc
         torch.save(model.state_dict(), "best_memristor_mri_model.pth")
         print("==> Best model saved!")
+
